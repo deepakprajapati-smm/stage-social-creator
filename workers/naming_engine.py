@@ -77,6 +77,26 @@ def _has_devanagari(text: str) -> bool:
 
 # ── Transliteration ────────────────────────────────────────────────────────
 
+_NUQTA_MAP = {
+    "ड़": "r",   # बांसवाड़ा → banswara
+    "ढ़": "rh",
+    "ज़": "z",
+    "फ़": "f",
+    "ग़": "gh",
+    "क़": "q",
+    "ख़": "kh",
+    "ं":  "n",   # anusvara
+    "ँ":  "n",   # chandrabindu
+    "ः":  "",    # visarga
+}
+
+def _preprocess_nuqta(text: str) -> str:
+    """Replace nuqta & anusvara chars before transliteration to avoid garbage output."""
+    text = unicodedata.normalize("NFC", text)
+    for src, dst in _NUQTA_MAP.items():
+        text = text.replace(src, dst)
+    return text
+
 def _transliterate(text: str) -> str:
     """
     Devanagari → clean Roman ASCII suitable for social handles.
@@ -87,7 +107,7 @@ def _transliterate(text: str) -> str:
         from indic_transliteration import sanscript
         from indic_transliteration.sanscript import transliterate
 
-        text = unicodedata.normalize("NFC", text)
+        text = _preprocess_nuqta(text)
         hk = transliterate(text, sanscript.DEVANAGARI, sanscript.HK)
 
         # HK → readable ASCII:
