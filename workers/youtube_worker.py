@@ -208,7 +208,13 @@ def create_youtube_channel(
         log.info(f"Connecting to Chrome at {cdp_url}")
         browser = p.chromium.connect_over_cdp(cdp_url)
         context = browser.contexts[0]
-        page    = context.new_page()
+        # Reuse existing page (avoids ERR_NAME_NOT_RESOLVED on new pages in debug Chrome)
+        if len(context.pages) > 1:
+            page = context.pages[1]  # Use Google tab
+        elif context.pages:
+            page = context.pages[0]
+        else:
+            page = context.new_page()
 
         page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
@@ -221,7 +227,14 @@ def create_youtube_channel(
             _delay(2.0, 4.0)
 
             if "accounts.google.com" in page.url or "signin" in page.url.lower():
-                return YTChannelResult(success=False, error="Google session expired — re-login in Chrome debug window")
+                return YTChannelResult(success=False, error="Google session expired — run: python scripts/login_helper.py")
+
+            # Check for sign-in button (logged out state)
+            signin_visible = page.locator('a[href*="accounts.google.com/ServiceLogin"], ytd-button-renderer:has-text("Sign in")').count() > 0
+            if signin_visible:
+                if screenshot_dir:
+                    page.screenshot(path=f"{screenshot_dir}/yt_not_logged_in.png")
+                return YTChannelResult(success=False, error="YouTube not logged in (Sign in button visible) — run: python scripts/login_helper.py")
 
             # ── Step 2: Navigate to channel creation ───────────────────────
             log.info("Navigating to create_channel...")
@@ -332,7 +345,11 @@ def create_youtube_channel(
             return YTChannelResult(success=False, error=str(e))
 
         finally:
-            page.close()
+            # Navigate back to YouTube homepage to keep the tab alive for next run
+            try:
+                page.evaluate("() => { window.location.href = 'https://www.youtube.com/'; }")
+            except Exception:
+                pass
 
 
 # ── CLI test ──────────────────────────────────────────────────────────────────

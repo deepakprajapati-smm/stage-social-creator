@@ -1,115 +1,108 @@
 """
-Facebook End-to-End Tests — Murat (TEA)
-Tests run against REAL Chrome CDP — no mocks
+Facebook Tests — Murat (TEA)
+Real Camoufox tests — no mocks
 """
 from __future__ import annotations
 import asyncio, json, os, sys
 from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-TEST_TITLE = "STAGE TEST DELETE 001"
-TEST_TITLE_ID = "test_fb_001"
+TEST_NAME = "STAGE TEST DELETE"
+TEST_ID   = "test_fb_001"
 
 
 async def test_1_cookies_exist():
-    """Test: fb_cookies.json exists and has c_user cookie"""
-    print("\n[TEST 1] Checking FB cookies file...")
+    print("\n[T1] Cookies check...")
     from config.settings import FB_COOKIES_FILE
-
-    assert os.path.exists(FB_COOKIES_FILE), (
-        f"FAIL: {FB_COOKIES_FILE} not found.\n"
-        "Run: python setup/get_fb_cookies.py"
-    )
-    with open(FB_COOKIES_FILE) as f:
-        cookies = json.load(f)
-
-    c_user = next((c for c in cookies if c["name"] == "c_user"), None)
-    assert c_user, "FAIL: c_user cookie not found — FB not logged in"
+    assert Path(FB_COOKIES_FILE).exists(), \
+        f"FAIL: {FB_COOKIES_FILE} nahi mili\nRun: python setup/setup_fb_worker.py"
+    cookies = json.loads(Path(FB_COOKIES_FILE).read_text())
+    assert any(c["name"] == "c_user" for c in cookies), \
+        "FAIL: c_user cookie nahi — session invalid"
+    c_user = next(c for c in cookies if c["name"] == "c_user")
     print(f"  ✅ Cookies valid. FB User ID: {c_user['value']}")
 
 
-async def test_2_chrome_cdp_reachable():
-    """Test: Chrome is running and CDP is reachable"""
-    print("\n[TEST 2] Checking Chrome CDP...")
-    import aiohttp
-    async with aiohttp.ClientSession() as s:
-        try:
-            async with s.get("http://localhost:9222/json/version", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                data = await r.json()
-                print(f"  ✅ Chrome CDP reachable. Browser: {data.get('Browser', 'unknown')}")
-        except Exception as e:
-            raise AssertionError(
-                f"FAIL: Chrome CDP not reachable.\n"
-                f"Run: bash scripts/launch_chrome.sh\n"
-                f"Error: {e}"
-            )
+async def test_2_camoufox_loads():
+    print("\n[T2] Camoufox basic launch check...")
+    from camoufox.async_api import AsyncCamoufox
+    async with AsyncCamoufox(headless=True) as browser:
+        page = await browser.new_page()
+        await page.goto("https://example.com", timeout=15000)
+        title = await page.title()
+        assert "Example" in title, f"FAIL: Unexpected title: {title}"
+    print(f"  ✅ Camoufox working. Page title: {title}")
 
 
-async def test_3_create_fb_page():
-    """Test: Create a real Facebook test page"""
-    print(f"\n[TEST 3] Creating FB test page: '{TEST_TITLE}'...")
+async def test_3_fb_session_valid():
+    print("\n[T3] FB session check...")
+    from camoufox.async_api import AsyncCamoufox
+    from config.settings import FB_COOKIES_FILE
+    cookies = json.loads(Path(FB_COOKIES_FILE).read_text())
+
+    async with AsyncCamoufox(headless=True, geoip=True) as browser:
+        page = await browser.new_page()
+        await browser.add_cookies(cookies)
+        await page.goto("https://www.facebook.com", wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(2)
+
+        assert "login" not in page.url, \
+            f"FAIL: FB login page — session expired\nURL: {page.url}\nRun: python setup/setup_fb_worker.py"
+        print(f"  ✅ FB session valid. URL: {page.url}")
+
+
+async def test_4_create_fb_page():
+    print(f"\n[T4] FB Page creation test: '{TEST_NAME}'...")
     from workers.facebook_worker import create_fb_page
+    result = await create_fb_page(TEST_NAME, TEST_ID)
 
-    result = await create_fb_page(TEST_TITLE, TEST_TITLE_ID)
-
-    assert result.get("page_url"), f"FAIL: No page_url in result: {result}"
-    assert "facebook.com" in result.get("page_url", ""), f"FAIL: Invalid page URL: {result}"
-
+    assert result.get("page_url"), f"FAIL: page_url missing. Result: {result}"
+    assert "facebook.com" in result["page_url"], f"FAIL: bad URL: {result['page_url']}"
     print(f"  ✅ Page created!")
-    print(f"     URL: {result['page_url']}")
-    print(f"     ID:  {result.get('page_id', 'N/A')}")
-    print(f"     Token: {'✓' if result.get('page_token') else 'Not fetched (META_SYSTEM_USER_TOKEN not set)'}")
+    print(f"     URL:   {result['page_url']}")
+    print(f"     ID:    {result.get('page_id', 'N/A')}")
+    print(f"     Token: {'✓' if result.get('page_token') else 'N/A (META_SYSTEM_USER_TOKEN not set)'}")
     return result
 
 
-async def test_4_db_record_saved():
-    """Test: DB has record of created page"""
-    print(f"\n[TEST 4] Verifying DB record...")
+async def test_5_db_record():
+    print(f"\n[T5] DB record check...")
     from db.models import get_session, TitleProfile
-
     session = get_session()
     try:
-        profile = session.query(TitleProfile).filter_by(title_id=TEST_TITLE_ID).first()
-        assert profile, f"FAIL: No DB record for title_id={TEST_TITLE_ID}"
-        assert profile.fb_page_url, "FAIL: fb_page_url not saved in DB"
-        print(f"  ✅ DB record saved. Status: {profile.status}")
+        p = session.query(TitleProfile).filter_by(title_id=TEST_ID).first()
+        assert p, f"FAIL: DB mein record nahi. title_id={TEST_ID}"
+        assert p.fb_page_url, "FAIL: fb_page_url DB mein nahi"
+        print(f"  ✅ DB record saved. Status: {p.status}, URL: {p.fb_page_url}")
     finally:
         session.close()
 
 
-async def run_all_tests():
-    print("=" * 60)
-    print("  STAGE Social Creator — Facebook Tests")
-    print("=" * 60)
+async def run_all():
+    print("=" * 55)
+    print("  STAGE Social Creator — Facebook Tests (Camoufox)")
+    print("=" * 55)
 
-    tests = [
-        test_1_cookies_exist,
-        test_2_chrome_cdp_reachable,
-        test_3_create_fb_page,
-        test_4_db_record_saved,
-    ]
+    tests = [test_1_cookies_exist, test_2_camoufox_loads,
+             test_3_fb_session_valid, test_4_create_fb_page, test_5_db_record]
+    passed = failed = 0
 
-    passed = 0
-    failed = 0
-
-    for test in tests:
+    for t in tests:
         try:
-            await test()
+            await t()
             passed += 1
         except AssertionError as e:
             print(f"  ❌ {e}")
             failed += 1
         except Exception as e:
-            print(f"  ❌ Unexpected error: {e}")
+            print(f"  ❌ {type(e).__name__}: {e}")
             failed += 1
 
-    print(f"\n{'='*60}")
-    print(f"  Results: {passed} passed, {failed} failed")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*55}")
+    print(f"  {passed} passed  |  {failed} failed")
+    print(f"{'='*55}\n")
     return failed == 0
 
-
 if __name__ == "__main__":
-    success = asyncio.run(run_all_tests())
-    sys.exit(0 if success else 1)
+    ok = asyncio.run(run_all())
+    sys.exit(0 if ok else 1)
