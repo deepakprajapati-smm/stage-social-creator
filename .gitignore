@@ -1,29 +1,10 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
 .env
-
-# Database
-*.db
-*.db-shm
-*.db-wal
-
-# Screenshots / logs
-/tmp/
-*.png
-*.log
-
-# Config overrides (keep settings.py template, ignore local overrides)
-config/settings_local.py
-
-# OS
+config/fb_cookies.json
+config/yt_tokens/
+data/
+*.pyc
+__pycache__/
 .DS_Store
-Thumbs.db
-
-# IDE
-.idea/
-.vscode/
-*.swp
+*.log
+venv/
+.venv/

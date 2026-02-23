@@ -1,240 +1,147 @@
 """
-api/main.py — FastAPI service for STAGE social profile creation
-
-Endpoints:
-  POST /create-profiles    — Create FB Page + YT Channel + IG Account for a title
-  GET  /status/{job_id}    — Check status of a creation job
-  GET  /jobs               — List all jobs
-
-Run: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
-
-Later: CRM will call POST /create-profiles when "Create Social Profiles" is clicked.
+FastAPI Webhook Server
+======================
+CMS "Create Social Profiles" button → POST /webhook/create-profiles
+Returns FB Page URL, YT Channel URL, IG Profile URL back to CMS
 """
+from __future__ import annotations
+import asyncio, hashlib, hmac, json, os, sys
+from pathlib import Path
 
-import logging
-import asyncio
-from typing import Optional
-from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config.settings import WEBHOOK_SECRET, CMS_CALLBACK_URL
+from db.models import init_db, get_session, TitleProfile
+from workers.facebook_worker import create_fb_page
 
-log = logging.getLogger(__name__)
+app = FastAPI(title="STAGE Social Creator API")
 
-app = FastAPI(
-    title="STAGE Social Creator",
-    description="Auto-create FB Page + YT Channel + IG Account for any title",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Thread pool for blocking workers (Playwright, Appium are sync)
-_executor = ThreadPoolExecutor(max_workers=4)
+# Init DB on startup
+@app.on_event("startup")
+async def startup():
+    init_db()
+    print("[API] Database initialized ✓")
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
-
-class CreateProfilesRequest(BaseModel):
-    title:      str                    # "Banswara Ki Kahani" or "बांसवाड़ा की कहानी"
-    language:   Optional[str] = None   # "vagdi", "hadoti", "hindi", "english" (optional hint)
-    crm_id:     Optional[str] = None   # CRM record ID to callback with results
-    callback_url: Optional[str] = None # URL to POST results when complete
-
-class CreateProfilesResponse(BaseModel):
-    job_id:    int
-    status:    str
-    handles:   dict
-    message:   str
-
-class StatusResponse(BaseModel):
-    job_id:    int
-    title:     str
-    status:    str
-    facebook:  dict
-    youtube:   dict
-    instagram: dict
+def verify_signature(body: bytes, signature: str) -> bool:
+    """HMAC-SHA256 signature verification"""
+    if not WEBHOOK_SECRET:
+        return True  # Skip verification if not configured
+    expected = hmac.new(
+        WEBHOOK_SECRET.encode(), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature)
 
 
-# ── Background job runner ─────────────────────────────────────────────────────
+async def _create_profiles_task(title_id: str, title_name: str, title_type: str):
+    """Background task: create all social profiles for a title"""
+    results = {"title_id": title_id, "title_name": title_name}
 
-def _run_creation_job(job_id: int, title: str, handles, callback_url: Optional[str]):
-    """
-    Run the full profile creation pipeline in background thread.
-    FB + YT run in parallel. IG runs after.
-    """
-    from db.database import DB
-    from workers.facebook_worker  import create_facebook_page
-    from workers.youtube_worker   import create_youtube_channel
-    from workers.instagram_worker import create_instagram_account
-    from config.settings import CHROME_CDP_URL, FB_CATEGORY
+    # ── Facebook Page ────────────────────────────────────────────────────────
+    try:
+        fb_result = await create_fb_page(title_name, title_id)
+        results["facebook"] = {
+            "status": "created",
+            "page_id": fb_result.get("page_id"),
+            "page_url": fb_result.get("page_url"),
+        }
+        print(f"[API] FB Page created: {fb_result.get('page_url')}")
+    except Exception as e:
+        results["facebook"] = {"status": "failed", "error": str(e)}
+        print(f"[API] FB Page failed: {e}")
 
-    db = DB()
-    db.set_status(job_id, "in_progress")
+    # ── YouTube Channel — Phase 3 ────────────────────────────────────────────
+    results["youtube"] = {"status": "pending", "note": "Phase 3"}
 
-    fb_result = None
-    yt_result = None
+    # ── Instagram — Phase 2 ─────────────────────────────────────────────────
+    results["instagram"] = {"status": "pending", "note": "Phase 2"}
 
-    # ── FB + YT in parallel threads ───────────────────────────────────────
-    def run_fb():
-        nonlocal fb_result
-        log.info(f"[job {job_id}] Starting FB page creation: {handles.fb_page_name}")
-        result = create_facebook_page(
-            page_name    = handles.fb_page_name,
-            category     = FB_CATEGORY,
-            cdp_url      = CHROME_CDP_URL,
-            screenshot_dir = f"/tmp/stage_job_{job_id}",
-        )
-        fb_result = result
-        if result.success:
-            db.update_fb(job_id, result.page_id or "", result.page_url or "", result.page_name or "")
-        else:
-            db.fail_fb(job_id, result.error or "Unknown error")
-
-    def run_yt():
-        nonlocal yt_result
-        log.info(f"[job {job_id}] Starting YT channel creation: {handles.yt_channel_name}")
-        result = create_youtube_channel(
-            channel_name   = handles.yt_channel_name,
-            cdp_url        = CHROME_CDP_URL,
-            screenshot_dir = f"/tmp/stage_job_{job_id}",
-        )
-        yt_result = result
-        if result.success:
-            db.update_yt(job_id, result.channel_id or "", result.channel_url or "",
-                         result.channel_name or "", result.handle)
-        else:
-            db.fail_yt(job_id, result.error or "Unknown error")
-
-    import threading
-    import os
-    os.makedirs(f"/tmp/stage_job_{job_id}", exist_ok=True)
-
-    fb_thread = threading.Thread(target=run_fb, name=f"fb-{job_id}")
-    yt_thread = threading.Thread(target=run_yt, name=f"yt-{job_id}")
-
-    fb_thread.start()
-    yt_thread.start()
-    fb_thread.join()
-    yt_thread.join()
-
-    # ── IG (sequential, needs GeeLark + OTP) ──────────────────────────────
-    log.info(f"[job {job_id}] Starting IG account creation: @{handles.ig_handle}")
-    ig_result = create_instagram_account(ig_handle=handles.ig_handle)
-    if ig_result.success:
-        db.update_ig_created(
-            job_id,
-            ig_result.ig_username or handles.ig_handle,
-            ig_result.ig_password or "",
-            ig_result.phone_used  or "",
-            ig_result.device_id   or "",
-            ig_result.warmup_status,
-        )
-    else:
-        db.fail_ig(job_id, ig_result.error or "Unknown error")
-
-    # ── Mark overall job status ────────────────────────────────────────────
-    job = db.get_job(job_id)
-    all_done   = all(job[k] == "done"    for k in ("fb_status", "yt_status"))
-    any_failed = any(job[k] == "failed"  for k in ("fb_status", "yt_status", "ig_status"))
-
-    if all_done and ig_result.success:
-        db.mark_complete(job_id)
-        log.info(f"[job {job_id}] All platforms created successfully")
-    elif any_failed:
-        db.mark_failed(job_id)
-        log.warning(f"[job {job_id}] Some platforms failed")
-    else:
-        db.set_status(job_id, "partial")
-
-    # ── Callback to CRM if URL provided ───────────────────────────────────
-    if callback_url:
+    # ── Callback to CMS ─────────────────────────────────────────────────────
+    if CMS_CALLBACK_URL:
         try:
-            import requests
-            payload = db.summary(job_id)
-            requests.post(callback_url, json=payload, timeout=10)
-            log.info(f"[job {job_id}] Callback sent to {callback_url}")
+            import httpx
+            async with httpx.AsyncClient() as client:
+                await client.post(CMS_CALLBACK_URL, json=results, timeout=10)
+            print(f"[API] CMS callback sent ✓")
         except Exception as e:
-            log.warning(f"[job {job_id}] Callback failed: {e}")
+            print(f"[API] CMS callback failed: {e}")
+
+    return results
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@app.post("/create-profiles", response_model=CreateProfilesResponse)
-async def create_profiles(req: CreateProfilesRequest, background_tasks: BackgroundTasks):
+@app.post("/webhook/create-profiles")
+async def create_profiles(request: Request, background_tasks: BackgroundTasks):
     """
-    Start creating social profiles for a title.
-
-    Returns immediately with job_id.
-    Check progress at GET /status/{job_id}
+    CMS calls this when 'Create Social Profiles' button is clicked.
+    
+    Expected payload:
+    {
+        "title_id": "cms_123",
+        "title_name": "Paani Wali Bahu",
+        "title_type": "series"   // movie/series/microdrama
+    }
     """
-    from workers.naming_engine import generate_handles
-    from db.database import DB
-    from config.settings import BRAND_PREFIX
+    body = await request.body()
 
-    # Generate handles
-    handles = generate_handles(req.title, brand_prefix=BRAND_PREFIX)
+    # Verify signature
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if sig and not verify_signature(body, sig):
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # Create DB job
-    db    = DB()
-    job_id = db.create_job(req.title, handles)
+    payload = json.loads(body)
+    title_id = payload.get("title_id")
+    title_name = payload.get("title_name")
+    title_type = payload.get("title_type", "content")
 
-    # Start background job
+    if not title_id or not title_name:
+        raise HTTPException(status_code=400, detail="title_id and title_name required")
+
+    # Check idempotency — don't create twice for same title
+    session = get_session()
+    existing = session.query(TitleProfile).filter_by(title_id=title_id).first()
+    session.close()
+
+    if existing and existing.fb_page_id:
+        return JSONResponse({
+            "status": "already_exists",
+            "title_id": title_id,
+            "fb_page_url": existing.fb_page_url,
+        })
+
+    # Run creation in background — return immediately to CMS
     background_tasks.add_task(
-        _run_creation_job,
-        job_id=job_id,
-        title=req.title,
-        handles=handles,
-        callback_url=req.callback_url,
+        _create_profiles_task, title_id, title_name, title_type
     )
 
-    log.info(f"Created job {job_id} for title: {req.title}")
-
-    return CreateProfilesResponse(
-        job_id  = job_id,
-        status  = "pending",
-        handles = handles.as_dict(),
-        message = f"Profile creation started. Check /status/{job_id} for progress.",
-    )
+    return JSONResponse({
+        "status": "creating",
+        "title_id": title_id,
+        "message": "Social profiles creation started. CMS will be notified when done.",
+    })
 
 
-@app.get("/status/{job_id}", response_model=StatusResponse)
-async def get_status(job_id: int):
-    """Get the current status of a profile creation job."""
-    from db.database import DB
-
-    db  = DB()
-    job = db.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
-    summary = db.summary(job_id)
-    return StatusResponse(**summary)
-
-
-@app.get("/jobs")
-async def list_jobs(status: Optional[str] = None):
-    """List all jobs, optionally filtered by status."""
-    from db.database import DB
-    db   = DB()
-    jobs = db.list_jobs(status=status)
-    return {"jobs": [db.summary(j["id"]) for j in jobs], "total": len(jobs)}
+@app.get("/status/{title_id}")
+async def get_status(title_id: str):
+    """Check creation status for a title"""
+    session = get_session()
+    try:
+        profile = session.query(TitleProfile).filter_by(title_id=title_id).first()
+        if not profile:
+            raise HTTPException(status_code=404, detail="Title not found")
+        return {
+            "title_id": title_id,
+            "title_name": profile.title_name,
+            "status": profile.status,
+            "fb_page_url": profile.fb_page_url,
+            "yt_channel_url": profile.yt_channel_url,
+            "ig_username": profile.ig_username,
+        }
+    finally:
+        session.close()
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "stage-social-creator"}
-
-
-# ── Run ───────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import uvicorn
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
+    return {"status": "ok"}

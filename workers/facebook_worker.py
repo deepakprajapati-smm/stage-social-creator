@@ -1,311 +1,287 @@
 """
-workers/facebook_worker.py — Create a Facebook Page via Chrome CDP + Patchright
+Facebook Page Creation Worker — Ghost + Kai
+Chrome CDP + cookie injection. Zero manual steps.
 
 Flow:
-  1. Connect to existing Chrome (running at localhost:9222 with STAGE FB account logged in)
+  1. Load fb_cookies.json → inject into Chrome via CDP (bypass login entirely)
   2. Navigate to facebook.com/pages/create
-  3. Fill: page name + "Digital creator" category
-  4. Submit → extract page ID
-  5. Return FB page URL
-
-Prerequisites (one-time manual setup):
-  - Run: scripts/launch_chrome_debug.sh
-  - Log into STAGE's Facebook account in that Chrome window
-  - Keep Chrome running
+  3. page.route() intercepts GraphQL → injects category_ids (fixes field_exception bug)
+  4. Fill form, submit → extract Page URL + ID
+  5. Fetch Page token via Graph API
+  6. Save to DB
 """
+from __future__ import annotations
 
-import random
+import json
+import asyncio
 import re
+import sys
+import os
 import time
-import logging
-from dataclasses import dataclass
-from typing import Optional
+import requests
+import urllib.parse
 
-log = logging.getLogger(__name__)
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from config.settings import CDP_URL, FB_COOKIES_FILE, META_SYSTEM_USER_TOKEN
+from db.models import get_session, TitleProfile, TokenVault, EventLog
+from datetime import datetime, timezone
 
-
-@dataclass
-class FBPageResult:
-    success:   bool
-    page_id:   Optional[str] = None
-    page_url:  Optional[str] = None
-    page_name: Optional[str] = None
-    error:     Optional[str] = None
+# Valid FB Entertainment category ID (injected into GraphQL to fix field_exception)
+FB_CATEGORY_ENTERTAINMENT = 2200
 
 
-# ── Selector waterfalls ───────────────────────────────────────────────────────
-
-_NAME_SELECTORS = [
-    'input[name="name"]',
-    'input[placeholder="Page name"]',
-    '[aria-label="Page name"]',
-    '[aria-label="Name"]',
-    'input[data-testid="page-creation-name-input"]',
-    'form input[type="text"]:first-of-type',
-]
-
-_CATEGORY_SELECTORS = [
-    'input[placeholder="Category"]',
-    '[aria-label="Category"]',
-    'input[name="category"]',
-    '[aria-label*="category" i]',
-    '[placeholder*="category" i]',
-]
-
-_OPTION_SELECTORS = [
-    '[role="option"]:first-of-type',
-    'ul[role="listbox"] li:first-child',
-    'div[role="option"]:first-child',
-    'li[role="option"]:first-child',
-]
-
-_CREATE_SELECTORS = [
-    'div[aria-label="Create Page"]',
-    'div[role="button"]:has-text("Create Page")',
-    'button:has-text("Create Page")',
-    'div[role="button"]:has-text("Create")',
-    'button:has-text("Create")',
-]
-
-_BUSINESS_CHOOSER_SELECTORS = [
-    'div[role="button"]:has-text("Business or brand")',
-    'button:has-text("Business or brand")',
-    '[aria-label*="Business or brand"]',
-]
-
-
-# ── Human behaviour helpers ───────────────────────────────────────────────────
-
-def _delay(min_s: float = 0.8, max_s: float = 2.5):
-    time.sleep(random.uniform(min_s, max_s))
-
-def _human_type(page, selector: str, text: str, delay_range=(100, 280)):
-    """Type text with per-character random delay (ms) to simulate human typing."""
-    el = page.locator(selector).first
-    el.click()
-    _delay(0.3, 0.7)
-    for char in text:
-        page.keyboard.type(char, delay=random.randint(*delay_range))
-
-def _human_scroll(page, pixels: Optional[int] = None):
-    """Scroll a small random amount (simulate human reading)."""
-    px = pixels or random.randint(60, 220)
-    page.mouse.wheel(0, px)
-    _delay(0.3, 0.8)
-
-def _find_and_click(page, selectors: list[str], timeout: int = 5000) -> bool:
-    """Try selectors in order, click the first one that exists. Return success."""
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=timeout):
-                # Simulate mouse move toward element before clicking
-                box = loc.bounding_box()
-                if box:
-                    tx = box["x"] + box["width"] / 2 + random.uniform(-4, 4)
-                    ty = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
-                    page.mouse.move(tx, ty, steps=random.randint(5, 12))
-                    _delay(0.1, 0.3)
-                loc.click()
-                return True
-        except Exception:
-            continue
-    return False
-
-def _find_selector(page, selectors: list[str], timeout: int = 5000) -> Optional[str]:
-    """Return the first selector that matches a visible element."""
-    for sel in selectors:
-        try:
-            if page.locator(sel).first.is_visible(timeout=timeout):
-                return sel
-        except Exception:
-            continue
-    return None
-
-
-# ── Page ID extraction ────────────────────────────────────────────────────────
-
-def _extract_page_id(url: str, content: str) -> Optional[str]:
-    """Extract FB page numeric ID from URL or page source."""
-    # Pattern 1: ?id=123456789
-    m = re.search(r"[?&]id=(\d{10,})", url)
-    if m:
-        return m.group(1)
-
-    # Pattern 2: /pages/slug/123456789/
-    m = re.search(r"/pages/[^/]+/(\d{10,})", url)
-    if m:
-        return m.group(1)
-
-    # Pattern 3: profile.php?id=
-    m = re.search(r"profile\.php\?id=(\d{10,})", url)
-    if m:
-        return m.group(1)
-
-    # Pattern 4: scan page source for page ID
-    m = re.search(r'"page_id":"?(\d{10,})"?', content)
-    if m:
-        return m.group(1)
-
-    return None
-
-
-# ── Main worker ───────────────────────────────────────────────────────────────
-
-def create_facebook_page(
-    page_name:    str,
-    category:     str = "Digital creator",
-    cdp_url:      str = "http://localhost:9222",
-    screenshot_dir: Optional[str] = None,
-) -> FBPageResult:
-    """
-    Create a Facebook Page using an existing Chrome session via CDP.
-
-    Args:
-        page_name:  Full page name, e.g. "STAGE Banswara Ki Kahani"
-        category:   FB category search string (default: "Digital creator")
-        cdp_url:    Chrome DevTools Protocol URL (default: localhost:9222)
-        screenshot_dir: If set, saves a screenshot on completion/failure
-
-    Returns:
-        FBPageResult with success, page_id, page_url, error
-    """
-    try:
-        from patchright.sync_api import sync_playwright
-        log.info("Using patchright (stealth mode)")
-    except ImportError:
-        from playwright.sync_api import sync_playwright
-        log.warning("patchright not installed — falling back to playwright (less stealthy)")
-
-    with sync_playwright() as p:
-        log.info(f"Connecting to Chrome at {cdp_url}")
-        browser = p.chromium.connect_over_cdp(cdp_url)
-        context = browser.contexts[0]
-        page    = context.new_page()
-
-        # Stealth: mask webdriver flag
-        page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+def _load_cookies() -> list[dict]:
+    if not os.path.exists(FB_COOKIES_FILE):
+        raise FileNotFoundError(
+            f"FB cookies not found: {FB_COOKIES_FILE}\n"
+            "Run: python setup/get_fb_cookies.py"
         )
+    with open(FB_COOKIES_FILE) as f:
+        return json.load(f)
 
-        try:
-            # ── Step 1: Verify FB session ──────────────────────────────────
-            log.info("Navigating to facebook.com to verify session...")
-            page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
-            _delay(2.0, 4.0)  # "reading" delay
 
-            if "login" in page.url.lower():
-                return FBPageResult(success=False, error="Facebook session expired — re-login in Chrome debug window")
+async def _open_fb_tab_via_cdp_http(port: int) -> None:
+    """
+    Opens facebook.com/pages/create via CDP HTTP API BEFORE Patchright starts.
+    Critical: Patchright CDP only sees tabs opened before the session begins.
+    """
+    import aiohttp
+    async with aiohttp.ClientSession() as s:
+        async with s.put(
+            f"http://localhost:{port}/json/new?https://www.facebook.com/pages/create"
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"CDP HTTP tab open failed: HTTP {resp.status}")
+            print("[FB] Tab opened via CDP HTTP ✓")
 
-            # ── Step 2: Navigate to page creation ─────────────────────────
-            log.info("Navigating to pages/create...")
-            page.goto("https://www.facebook.com/pages/create", wait_until="domcontentloaded", timeout=30000)
-            _delay(3.0, 6.0)  # longer delay — simulate reading the form
 
-            # ── Step 3: Handle Business/Creator chooser (if shown) ─────────
-            chooser = _find_selector(page, _BUSINESS_CHOOSER_SELECTORS, timeout=3000)
-            if chooser:
-                log.info("Business/Creator chooser visible — clicking 'Business or brand'")
-                _find_and_click(page, _BUSINESS_CHOOSER_SELECTORS)
-                _delay(0.8, 1.5)
+async def create_fb_page(title_name: str, title_id: str) -> dict:
+    """
+    Create a Facebook Page for a STAGE title. Returns page_id, page_url, page_token.
+    """
+    from patchright.async_api import async_playwright
 
-            # ── Step 4: Fill page name ─────────────────────────────────────
-            log.info(f"Filling page name: {page_name}")
-            name_sel = _find_selector(page, _NAME_SELECTORS, timeout=8000)
-            if not name_sel:
-                return FBPageResult(success=False, error="Could not find page name input — FB UI may have changed")
+    print(f"\n[FB] Creating page for: {title_name}")
+    cookies = _load_cookies()
 
-            _human_scroll(page)
-            _human_type(page, name_sel, page_name)
-            _delay(0.5, 1.0)
+    # ── 1. Open FB tab BEFORE Patchright (critical for CDP tab visibility) ──
+    await _open_fb_tab_via_cdp_http(9222)
+    await asyncio.sleep(6)  # Give tab time to load
 
-            # ── Step 5: Fill category ──────────────────────────────────────
-            log.info(f"Filling category: {category}")
-            cat_sel = _find_selector(page, _CATEGORY_SELECTORS, timeout=8000)
-            if not cat_sel:
-                log.warning("Category field not found — trying to submit without it")
-            else:
-                _human_type(page, cat_sel, category, delay_range=(150, 310))
-                _delay(1.5, 2.5)  # wait for autocomplete dropdown
+    # ── 2. Connect to existing Chrome — NO context manager (keeps tabs alive) ──
+    p = await async_playwright().start()
+    browser = await p.chromium.connect_over_cdp(CDP_URL)
+    context = browser.contexts[0]
 
-                # Click first option in dropdown
-                if not _find_and_click(page, _OPTION_SELECTORS, timeout=4000):
-                    log.warning("Category dropdown option not clicked — proceeding anyway")
-                _delay(0.5, 1.0)
+    # Find the Facebook tab we just opened
+    fb_tab = None
+    for pg in context.pages:
+        if "facebook.com" in pg.url:
+            fb_tab = pg
+            break
 
-            # ── Step 6: Scroll + pause before submitting ───────────────────
-            _human_scroll(page, random.randint(80, 200))
-            _delay(1.0, 2.5)  # "reviewing" pause
+    if not fb_tab:
+        fb_tab = await context.new_page()
 
-            # ── Step 7: Click Create Page ──────────────────────────────────
-            log.info("Clicking Create Page...")
-            if not _find_and_click(page, _CREATE_SELECTORS, timeout=8000):
-                if screenshot_dir:
-                    page.screenshot(path=f"{screenshot_dir}/fb_create_fail.png")
-                return FBPageResult(success=False, error="Create Page button not found or not clickable")
+    # ── 3. Inject cookies → logged in without any login flow ────────────────
+    print("[FB] Injecting session cookies...")
+    await context.add_cookies(cookies)
+    await fb_tab.reload(wait_until="networkidle", timeout=30000)
 
-            # ── Step 8: Wait for redirect ──────────────────────────────────
-            log.info("Waiting for redirect after page creation...")
-            for _ in range(30):
-                _delay(1.0, 1.0)
-                current_url = page.url
-                if "pages/create" not in current_url and "facebook.com" in current_url:
-                    break
-            else:
-                return FBPageResult(success=False, error="Timed out waiting for redirect after Create Page click")
+    # Verify login — not redirected to login/checkpoint
+    if "login" in fb_tab.url or "checkpoint" in fb_tab.url:
+        raise RuntimeError(
+            "Facebook session invalid.\n"
+            "Cookies expired — run: python setup/get_fb_cookies.py"
+        )
+    print(f"[FB] Logged in ✓  (URL: {fb_tab.url})")
 
-            _delay(2.0, 4.0)
-            current_url = page.url
+    # ── 4. Navigate to pages/create ─────────────────────────────────────────
+    if "pages/create" not in fb_tab.url:
+        await fb_tab.goto(
+            "https://www.facebook.com/pages/create",
+            wait_until="networkidle",
+            timeout=30000
+        )
+    print("[FB] On pages/create ✓")
 
-            # ── Step 9: Check for checkpoint ──────────────────────────────
-            if "checkpoint" in current_url or "checkpoint" in page.content().lower():
-                if screenshot_dir:
-                    page.screenshot(path=f"{screenshot_dir}/fb_checkpoint.png")
-                return FBPageResult(
-                    success=False,
-                    error="Facebook checkpoint triggered — human intervention required in Chrome debug window"
-                )
-
-            # ── Step 10: Extract page ID ───────────────────────────────────
-            page_id = _extract_page_id(current_url, page.content())
-            page_url = current_url if page_id else None
-
-            if page_id:
-                log.info(f"FB Page created: ID={page_id}, URL={page_url}")
-            else:
-                log.warning(f"Page created but ID not extracted from URL: {current_url}")
-                page_url = current_url
-
-            if screenshot_dir:
-                page.screenshot(path=f"{screenshot_dir}/fb_page_created.png")
-
-            return FBPageResult(
-                success  = True,
-                page_id  = page_id,
-                page_url = page_url,
-                page_name= page_name,
-            )
-
-        except Exception as e:
-            log.error(f"FB page creation error: {e}")
-            if screenshot_dir:
+    # ── 5. Set up GraphQL interceptor — fixes field_exception (category_ids) ──
+    async def inject_category_ids(route):
+        req = route.request
+        if req.method == "POST" and "graphql" in req.url:
+            raw = req.post_data or ""
+            if "additional_profile_plus_create" in raw or "create_page" in raw.lower():
                 try:
-                    page.screenshot(path=f"{screenshot_dir}/fb_error.png")
-                except Exception:
-                    pass
-            return FBPageResult(success=False, error=str(e))
+                    parsed = urllib.parse.parse_qs(raw)
+                    variables = json.loads(parsed.get("variables", ["{}"])[0])
 
-        finally:
-            page.close()
+                    # Inject category_ids wherever they should go
+                    inp = variables.get("input", variables)
+                    inp["category_ids"] = [FB_CATEGORY_ENTERTAINMENT]
+
+                    if "input" in variables:
+                        variables["input"] = inp
+                    else:
+                        variables = inp
+
+                    parsed["variables"] = [json.dumps(variables)]
+                    new_body = urllib.parse.urlencode({k: v[0] for k, v in parsed.items()})
+                    print(f"[FB] GraphQL intercepted — category_ids injected ✓")
+                    await route.continue_(post_data=new_body)
+                    return
+                except Exception as e:
+                    print(f"[FB] Interceptor non-fatal error: {e}")
+        await route.continue_()
+
+    await fb_tab.route("**/*graphql*", inject_category_ids)
+
+    # ── 6. Type page name ────────────────────────────────────────────────────
+    print(f"[FB] Typing page name: {title_name}")
+    name_sel = 'input[name="name"], input[placeholder*="name" i], input[aria-label*="name" i]'
+    name_input = await fb_tab.wait_for_selector(name_sel, timeout=15000)
+    await asyncio.sleep(0.8)
+    await name_input.click()
+    await name_input.fill("")  # Clear any existing value
+    await name_input.type(title_name, delay=75)
+    await asyncio.sleep(1.5)
+
+    # ── 7. Select category ───────────────────────────────────────────────────
+    print("[FB] Selecting category: Entertainment")
+    cat_sel = 'input[placeholder*="categor" i], input[aria-label*="categor" i]'
+    try:
+        cat_input = await fb_tab.wait_for_selector(cat_sel, timeout=8000)
+        await cat_input.click()
+        await asyncio.sleep(0.5)
+        await cat_input.type("Entertainment", delay=75)
+        await asyncio.sleep(1.5)
+
+        # Click the first matching option in dropdown
+        option = await fb_tab.wait_for_selector(
+            '[role="option"]:first-child, [role="listbox"] [role="option"]:first-child',
+            timeout=6000
+        )
+        await option.click()
+        await asyncio.sleep(1)
+        print("[FB] Category selected ✓")
+    except Exception as e:
+        print(f"[FB] Category selection warning: {e} — continuing anyway")
+
+    # ── 8. Click Create Page ─────────────────────────────────────────────────
+    print("[FB] Clicking Create Page...")
+    btn_sel = (
+        'button[type="submit"], '
+        'div[role="button"]:has-text("Create Page"), '
+        'div[aria-label*="Create Page"]'
+    )
+    create_btn = await fb_tab.wait_for_selector(btn_sel, timeout=10000)
+    await asyncio.sleep(0.5)
+    await create_btn.click()
+
+    # ── 9. Wait for redirect to new page URL ────────────────────────────────
+    print("[FB] Waiting for page creation to complete...")
+    await fb_tab.wait_for_url(
+        lambda url: (
+            re.search(r"facebook\.com/[^/]+/(about|settings|dashboard|posts)", url) is not None
+            or re.search(r"facebook\.com/\d+", url) is not None
+        ),
+        timeout=30000
+    )
+    page_url = fb_tab.url
+    print(f"[FB] Page created! URL: {page_url}")
+
+    # ── 10. Extract Page ID ──────────────────────────────────────────────────
+    page_id = _extract_page_id(page_url)
+
+    # ── 11. Fetch Page Access Token via Graph API ────────────────────────────
+    page_token = None
+    if META_SYSTEM_USER_TOKEN:
+        page_token = _fetch_page_token(page_id, title_name)
+
+    result = {
+        "page_id": page_id,
+        "page_url": page_url,
+        "page_token": page_token,
+    }
+
+    # ── 12. Save to DB ───────────────────────────────────────────────────────
+    _save_to_db(title_id, title_name, result)
+
+    # ── 13. Remove route interceptor (keep Chrome alive) ────────────────────
+    await fb_tab.unroute("**/*graphql*")
+
+    print(f"[FB] ✅ Done — {title_name}")
+    return result
 
 
-# ── CLI test ──────────────────────────────────────────────────────────────────
+def _extract_page_id(url: str) -> str | None:
+    # Numeric ID in URL
+    m = re.search(r"facebook\.com/(\d{10,})", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _fetch_page_token(page_id: str | None, page_name: str) -> str | None:
+    """Get Page Access Token from /me/accounts"""
+    if not META_SYSTEM_USER_TOKEN:
+        return None
+    try:
+        resp = requests.get(
+            "https://graph.facebook.com/v19.0/me/accounts",
+            params={"access_token": META_SYSTEM_USER_TOKEN, "fields": "id,name,access_token"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        for page in resp.json().get("data", []):
+            if (page_id and page.get("id") == page_id) or \
+               page.get("name", "").lower() == page_name.lower():
+                return page.get("access_token")
+    except Exception as e:
+        print(f"[FB] Token fetch failed: {e}")
+    return None
+
+
+def _save_to_db(title_id: str, title_name: str, result: dict):
+    session = get_session()
+    try:
+        profile = session.query(TitleProfile).filter_by(title_id=title_id).first()
+        if not profile:
+            profile = TitleProfile(
+                title_id=title_id, title_name=title_name, title_type="content"
+            )
+            session.add(profile)
+
+        profile.fb_page_id = result.get("page_id")
+        profile.fb_page_url = result.get("page_url")
+        profile.status = "fb_done"
+        profile.updated_at = datetime.now(timezone.utc)
+
+        if result.get("page_token"):
+            session.add(TokenVault(
+                title_id=title_id,
+                platform="facebook",
+                token_type="page_token",
+                token_value=result["page_token"],
+                expires_at=None,
+            ))
+
+        session.add(EventLog(
+            entity_type="title",
+            entity_id=title_id,
+            event_type="fb_page_created",
+            event_data=json.dumps(result),
+        ))
+        session.commit()
+        print("[DB] Saved ✓")
+    except Exception as e:
+        session.rollback()
+        print(f"[DB] Save failed: {e}")
+    finally:
+        session.close()
+
 
 if __name__ == "__main__":
-    import sys
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
     name = sys.argv[1] if len(sys.argv) > 1 else "STAGE Test Page"
-    print(f"\nCreating FB page: '{name}'")
-    result = create_facebook_page(page_name=name, screenshot_dir="/tmp")
-    print(f"\nResult: {result}")
+    tid  = sys.argv[2] if len(sys.argv) > 2 else "test_001"
+    result = asyncio.run(create_fb_page(name, tid))
+    print(f"\n✅ Result:\n{json.dumps(result, indent=2)}")

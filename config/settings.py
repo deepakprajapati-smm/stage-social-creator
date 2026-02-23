@@ -1,69 +1,32 @@
-"""
-config/settings.py — All API keys and configuration for stage-social-creator.
-Copy this file to config/settings_local.py and fill in your actual keys.
-"""
+from __future__ import annotations
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 
-# ─────────────────────────────────────────────
-# GeeLark API
-# Get from: geelark.com → Dashboard → API section → open.geelark.com/api
-# ─────────────────────────────────────────────
-GEELARK_API_TOKEN = os.getenv("GEELARK_API_TOKEN", "YOUR_GEELARK_API_TOKEN")
-GEELARK_API_BASE  = "https://api.geelark.com"
+load_dotenv()
 
-# GeeLark cloud phone config
-GEELARK_ANDROID_VERSION = "Android12"  # Android11 or Android12
-GEELARK_WARMUP_TEMPLATE_ID = "instagram-ai-account-warmup"  # from Automation Marketplace
+BASE_DIR = Path(__file__).parent.parent
+CONFIG_DIR = BASE_DIR / "config"
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
-# ─────────────────────────────────────────────
-# SMS OTP Services
-# Primary: SMS-Man.com (sms-activate.io shut down Dec 2025)
-# Bulk:    5sim.net
-# ─────────────────────────────────────────────
-SMSMAN_API_KEY   = os.getenv("SMSMAN_API_KEY", "YOUR_SMSMAN_API_KEY")
-SMSMAN_BASE_URL  = "https://api.sms-man.com/control"
+CHROME_DEBUG_PORT = int(os.getenv("CHROME_DEBUG_PORT", "9222"))
+CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", str(Path.home() / ".chrome-stage-debug"))
+CDP_URL = f"http://localhost:{CHROME_DEBUG_PORT}"
 
-FIVESIM_API_KEY  = os.getenv("FIVESIM_API_KEY", "YOUR_5SIM_JWT_TOKEN")
-FIVESIM_BASE_URL = "https://5sim.net/v1"
+FB_COOKIES_FILE = os.getenv("FB_COOKIES_FILE", str(CONFIG_DIR / "fb_cookies.json"))
+META_APP_ID = os.getenv("META_APP_ID", "")
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")
+META_SYSTEM_USER_TOKEN = os.getenv("META_SYSTEM_USER_TOKEN", "")
+META_BUSINESS_ID = os.getenv("META_BUSINESS_ID", "")
 
-# Which OTP service to use: "smsman" or "fivesim"
-OTP_SERVICE      = os.getenv("OTP_SERVICE", "smsman")
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 
-# Country for phone numbers (India = 14 on smsman, "india" on 5sim)
-OTP_COUNTRY_SMSMAN  = 14    # India
-OTP_COUNTRY_FIVESIM = "india"
+DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "stage_social.db"))
+DB_URL = f"sqlite:///{DB_PATH}"
 
-# ─────────────────────────────────────────────
-# Proxy config (Coronium.io 4G India proxies)
-# Get from: coronium.io → Dashboard → Your proxies
-# Format: "http://user:pass@host:port"
-# ─────────────────────────────────────────────
-PROXY_URL = os.getenv("PROXY_URL", "http://user:pass@proxy.coronium.io:PORT")
-
-# ─────────────────────────────────────────────
-# Chrome CDP (for FB + YT via existing Chrome)
-# Launch Chrome with: scripts/launch_chrome_debug.sh
-# ─────────────────────────────────────────────
-CHROME_CDP_URL       = os.getenv("CHROME_CDP_URL", "http://localhost:9222")
-CHROME_USER_DATA_DIR = os.path.expanduser("~/.chrome-stage-debug")
-
-# ─────────────────────────────────────────────
-# Database
-# ─────────────────────────────────────────────
-DB_PATH = os.getenv("DB_PATH", "stage_social.db")
-
-# ─────────────────────────────────────────────
-# Brand settings
-# ─────────────────────────────────────────────
-BRAND_PREFIX    = "STAGE"           # e.g. STAGE Banswara
-BRAND_PREFIX_LC = "stage"           # for IG handles: stage.banswara
-FB_CATEGORY     = "Digital creator" # search string for FB category autocomplete
-
-# ─────────────────────────────────────────────
-# Timing (seconds)
-# ─────────────────────────────────────────────
-WARMUP_DAYS          = 30   # days before IG account is "ready"
-OTP_POLL_INTERVAL    = 10   # seconds between OTP checks
-OTP_MAX_WAIT         = 300  # 5 minutes max wait for OTP
-CHROME_ACTION_DELAY  = (0.8, 2.5)   # min/max seconds between CDP actions
-YT_BETWEEN_CHANNELS  = 600          # 10 min between YT channel creations
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8000"))
+CMS_CALLBACK_URL = os.getenv("CMS_CALLBACK_URL", "")
